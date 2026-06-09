@@ -1,21 +1,19 @@
-"""FenceScout scan service (Railway).
+"""FenceScout scan service (Railway) — homes-list mode.
 
-POST /scan      {polygon:[[lng,lat],...], name?}  -> {job_id, home_count}
-GET  /scan/{id}                                   -> {status,total,scanned,results[]}
-GET  /                                             -> health
+The browser sends the list of homes it already fetched from LOJIC (an IP LOJIC
+allows). This service does ONLY the part that must run on a server: pull the
+Google satellite per home and run OpenCV fence detection. Ranks by NO-FENCE
+score (high = genuinely needs a fence = mail a postcard).
 
-Draws on the existing engine (parcel_ky, imagery, detect). For each home in the
-drawn territory: parcel polygon -> centroid -> satellite -> detect.fence_score.
-Ranks by NO-FENCE score (high = genuinely needs a fence = mail a postcard).
+Endpoints:
+  POST /scan       {homes:[{addr,lat,lng,pin?}], name?}  -> {job_id, home_count}
+  GET  /scan/{id}                                        -> {status,total,scanned,results[]}
+  GET  /selftest                                         -> {satellite: bool}  (Railway->Google check)
+  GET  /                                                 -> health
 
-Env:
-  DATABASE_URL     Railway Postgres (provided automatically)
-  ALLOW_ORIGINS    comma list, e.g. https://top-rail-louisville.vercel.app
-  SCAN_API_KEY     optional shared key required in X-Api-Key header
-  GOOGLE_MAPS_KEY  optional; if set + Maps Static API allowed on the key, used
-                   for satellite. Otherwise falls back to free tiles.
+Env: DATABASE_URL, ALLOW_ORIGINS, SCAN_API_KEY (optional), GOOGLE_MAPS_KEY (optional).
 """
-import os, io, json, math, time, hashlib, threading
+import os, io, hashlib, time
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image
@@ -24,17 +22,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2, psycopg2.extras
 
-import detect, imagery, parcel_ky
+import detect, imagery
 
-ADDR_URL = "https://gis.lojic.org/maps/rest/services/LojicSolutions/OpenDataAddresses/MapServer/0/query"
-UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-RATE_WOOD, RATE_VINYL, INSTALL_FRAC = 36, 49, 0.70
+RATE_WOOD, RATE_VINYL = 36, 49
+DEFAULT_LF = 250                      # estimate until per-parcel perimeter is wired
 DATABASE_URL = os.environ["DATABASE_URL"]
 ALLOW_ORIGINS = os.environ.get("ALLOW_ORIGINS", "*").split(",")
 SCAN_API_KEY = os.environ.get("SCAN_API_KEY", "")
 MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY", "")
-MAX_HOMES = int(os.environ.get("MAX_HOMES", "1500"))   # guardrail against giant scans
+MAX_HOMES = int(os.environ.get("MAX_HOMES", "1500"))
 WORKERS = int(os.environ.get("WORKERS", "8"))
 
 
@@ -58,67 +54,21 @@ app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS,
                    allow_methods=["*"], allow_headers=["*"])
 
 
+class Home(BaseModel):
+    addr: str
+    lat: float
+    lng: float
+    pin: str | None = None
+
+
 class ScanReq(BaseModel):
-    polygon: list
+    homes: list[Home]
     name: str | None = None
 
 
 def _require_key(x_api_key):
     if SCAN_API_KEY and x_api_key != SCAN_API_KEY:
         raise HTTPException(401, "bad api key")
-
-
-# ---------- LOJIC: homes inside the drawn polygon ----------
-def homes_in_polygon(ring):
-    ring = ring + [ring[0]]
-    geom = json.dumps({"rings": [ring], "spatialReference": {"wkid": 4326}})
-    feats, offset = [], 0
-    for _ in range(8):
-        r = requests.post(ADDR_URL, data={
-            "geometry": geom, "geometryType": "esriGeometryPolygon", "inSR": "4326",
-            "spatialRel": "esriSpatialRelIntersects",
-            "outFields": "ADDRESS,PARCELID,HOUSENO,STRNAME,TYPE,ZIPCODE,APT",
-            "returnGeometry": "true", "outSR": "4326", "f": "json",
-            "resultRecordCount": "2000", "resultOffset": str(offset),
-        }, headers=UA, timeout=40).json()
-        page = r.get("features", [])
-        feats += page
-        if not r.get("exceededTransferLimit") or not page:
-            break
-        offset += len(page)
-    by_pin = {}
-    for f in feats:
-        pin = f["attributes"].get("PARCELID")
-        if pin:
-            by_pin.setdefault(pin, []).append(f)
-    homes = []
-    for pin, group in by_pin.items():
-        if len(group) > 1:
-            continue
-        a = group[0]["attributes"]
-        g = group[0].get("geometry", {})
-        if (a.get("APT") or "").strip() or "x" not in g:
-            continue
-        addr = " ".join(p for p in [str(a.get("HOUSENO", "")).strip(),
-                                    (a.get("STRNAME") or "").strip(),
-                                    (a.get("TYPE") or "").strip()] if p)
-        if not addr:
-            continue
-        homes.append({"pin": pin, "addr": addr, "lat": g["y"], "lng": g["x"]})
-    return homes
-
-
-def _centroid(ring):
-    A = cx = cy = 0.0
-    pts = ring + [ring[0]] if ring[0] != ring[-1] else ring
-    for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
-        cr = x1 * y2 - x2 * y1
-        A += cr; cx += (x1 + x2) * cr; cy += (y1 + y2) * cr
-    if A == 0:
-        xs = [p[0] for p in ring]; ys = [p[1] for p in ring]
-        return sum(xs) / len(xs), sum(ys) / len(ys)
-    A *= 0.5
-    return cx / (6 * A), cy / (6 * A)
 
 
 def _sat_static(lat, lng):
@@ -130,30 +80,23 @@ def _sat_static(lat, lng):
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
 
-def _get_sat(lat, lng):
+def get_sat(lat, lng):
     if MAPS_KEY:
         im = _sat_static(lat, lng)
         if im is not None:
             return im
-    return imagery.pull_satellite(lat, lng, zoom=21, px_size=600)   # free-tile fallback
+    return imagery.pull_satellite(lat, lng, zoom=21, px_size=600)
 
 
 def score_home(h):
     try:
-        ring = parcel_ky._fetch_parcel_geom(h["pin"])
-        if not ring:
-            return None
-        clng, clat = _centroid(ring)
-        perim = parcel_ky._polygon_perimeter_ft_haversine(ring)
-        if perim > 1200 or perim < 240:
-            return None
-        sat = _get_sat(clat, clng)
+        sat = get_sat(h["lat"], h["lng"])
         if sat is None:
             return None
-        sc = detect.fence_score(sat, polygon_lnglat=ring, center_latlng=(clat, clng))
+        sc = detect.fence_score(sat, polygon_lnglat=None, center_latlng=(h["lat"], h["lng"]))
         nf = round(100 - sc["fence_present_score"], 1)
-        lf = round(perim * INSTALL_FRAC)
-        return (h["pin"], h["addr"], h["lat"], h["lng"], nf,
+        lf = DEFAULT_LF
+        return (h.get("pin") or "", h["addr"], h["lat"], h["lng"], nf,
                 sc["fence_present_score"] >= 40, lf,
                 round(lf * RATE_WOOD, -2), round(lf * RATE_VINYL, -2))
     except Exception:
@@ -182,11 +125,11 @@ def run_job(job_id, homes):
 @app.post("/scan")
 def scan(req: ScanReq, background: BackgroundTasks, x_api_key: str = Header(default="")):
     _require_key(x_api_key)
-    if not req.polygon or len(req.polygon) < 3:
-        raise HTTPException(400, "polygon needs >=3 points [[lng,lat],...]")
-    homes = homes_in_polygon(req.polygon)
+    homes = [h.dict() for h in req.homes]
+    if not homes:
+        raise HTTPException(400, "no homes provided")
     if len(homes) > MAX_HOMES:
-        raise HTTPException(413, f"{len(homes)} homes exceeds the {MAX_HOMES} cap — draw a smaller area")
+        raise HTTPException(413, f"{len(homes)} homes exceeds the {MAX_HOMES} cap")
     job_id = hashlib.sha1(f"{time.time()}:{len(homes)}".encode()).hexdigest()[:12]
     conn = db()
     with conn, conn.cursor() as cur:
@@ -211,6 +154,16 @@ def status(job_id: str):
     conn.close()
     return {"status": job["status"], "total": job["total"], "scanned": job["scanned"],
             "results": rows}
+
+
+@app.get("/selftest")
+def selftest():
+    """Confirm Railway can reach Google satellite (LOJIC blocked Railway, so verify Google)."""
+    try:
+        im = get_sat(38.28536, -85.48754)
+        return {"satellite": im is not None, "size": (list(im.size) if im else None)}
+    except Exception as e:
+        return {"satellite": False, "error": str(e)[:200]}
 
 
 @app.get("/")
