@@ -59,6 +59,7 @@ class Home(BaseModel):
     lat: float
     lng: float
     pin: str | None = None
+    lf: int | None = None        # lineal feet from the browser's parcel measure; falls back to DEFAULT_LF
 
 
 class ScanReq(BaseModel):
@@ -95,7 +96,7 @@ def score_home(h):
             return None
         sc = detect.fence_score(sat, polygon_lnglat=None, center_latlng=(h["lat"], h["lng"]))
         nf = round(100 - sc["fence_present_score"], 1)
-        lf = DEFAULT_LF
+        lf = int(h.get("lf") or 0) or DEFAULT_LF
         return (h.get("pin") or "", h["addr"], h["lat"], h["lng"], nf,
                 sc["fence_present_score"] >= 40, lf,
                 round(lf * RATE_WOOD, -2), round(lf * RATE_VINYL, -2))
