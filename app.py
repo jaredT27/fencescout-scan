@@ -13,7 +13,8 @@ Endpoints:
 
 Env: DATABASE_URL, ALLOW_ORIGINS, SCAN_API_KEY (optional), GOOGLE_MAPS_KEY (optional).
 """
-import os, io, hashlib, time
+import os, io, hashlib, time, json, threading
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from PIL import Image
@@ -60,6 +61,10 @@ def init_db():
         cur.execute("create table if not exists leads(id serial primary key, created timestamptz default now(), "
                     "name text, email text, phone text, address1 text, city text, state text, postal text, "
                     "variant text, page text, notes text, sm_result int, sm_contact_id text, sm_message text)")
+        cur.execute("create table if not exists outbound_queue(id serial primary key, created timestamptz default now(), "
+                    "send_after timestamptz, payload text, status text default 'queued', sent_at timestamptz, "
+                    "sm_result int, sm_contact_id text, sm_message text)")
+        cur.execute("create index if not exists idx_outbound_due on outbound_queue(status, send_after)")
 
 
 init_db()
@@ -147,68 +152,63 @@ def _parse_address(combined):
     return a1, city, state, postal
 
 
-@app.post("/lead")
-def lead(req: LeadReq):
-    """Landing-form -> ServiceMinder. Browser posts JSON here; we map fields and
-    forward form-encoded to ServiceMinder's addupdate webhook with the key held
-    server-side. Fires immediately (warm responders = speed-to-lead)."""
-    if not SM_LEAD_KEY:
-        raise HTTPException(500, "SM_LEAD_KEY not configured")
-
-    first, last = _split_name(req.name)
-    # prefer explicit components; fall back to parsing the combined string
-    a1, city, state, postal = (req.address1 or ""), (req.city or ""), (req.state or ""), (req.zip or "")
+def _map_lead(d, source_note="Lead from FenceScout landing page."):
+    """Map a lead dict -> ServiceMinder FORM-POST payload. Used by both the
+    instant inbound /lead path and the delayed outbound flush."""
+    first, last = _split_name(d.get("name"))
+    a1, city, state, postal = (d.get("address1") or ""), (d.get("city") or ""), (d.get("state") or ""), (d.get("zip") or "")
     if not (a1 and city and postal):
-        pa1, pcity, pstate, ppostal = _parse_address(req.address)
-        a1 = a1 or pa1
-        city = city or pcity
-        state = state or pstate
-        postal = postal or ppostal
+        pa1, pcity, pstate, ppostal = _parse_address(d.get("address"))
+        a1 = a1 or pa1; city = city or pcity; state = state or pstate; postal = postal or ppostal
     state = state or SM_DEFAULT_STATE
     if not city and postal in ZIP_CITY:
         city = ZIP_CITY[postal]
-
-    variant = (req.version or "").lower()
-    note_lines = ["Lead from FenceScout landing page."]
-    if req.style:  note_lines.append(f"Fence style: {req.style}")
-    if req.lf:     note_lines.append(f"Estimated fence length: {req.lf} ft")
-    if req.quote:  note_lines.append(f"Quoted range: {req.quote}")
-    if variant:    note_lines.append(f"Postcard variant: {variant.upper()}")
-    if req.page:   note_lines.append(f"Landing page: {req.page}")
-    if req.test:   note_lines.insert(0, "*** TEST LEAD - DO NOT CALL ***")
-    notes = "\n".join(note_lines)
-
+    variant = (d.get("version") or "").lower()
+    notes = [source_note]
+    if d.get("style"): notes.append(f"Fence style: {d['style']}")
+    if d.get("lf"):    notes.append(f"Estimated fence length: {d['lf']} ft")
+    if d.get("quote"): notes.append(f"Quoted range: {d['quote']}")
+    if variant:        notes.append(f"Postcard variant: {variant.upper()}")
+    if d.get("page"):  notes.append(f"Landing page: {d['page']}")
+    if d.get("test"):  notes.insert(0, "*** TEST LEAD - DO NOT CALL ***")
     tags = "FenceScout" + (f",variant-{variant}" if variant in ("a", "b") else "")
-    payload = {
+    return {
         "FirstName": first, "LastName": last,
-        "Email": req.email or "", "Phone1": req.phone or "", "Phone1Type": "Mobile",
+        "Email": d.get("email") or "", "Phone1": d.get("phone") or "", "Phone1Type": "Mobile",
         "Address1": a1, "City": city, "State": state, "PostalCode": postal,
         "Channel": SM_CHANNEL, "Campaign": SM_CAMPAIGN,
-        "Tags": tags, "ContactType": "Prospect", "Notes": notes,
+        "Tags": tags, "ContactType": "Prospect", "Notes": "\n".join(notes),
     }
+
+
+def _post_sm(payload):
+    """POST a mapped payload to ServiceMinder. Returns (result, contact_id, message)."""
     try:
         r = requests.post(SM_LEAD_URL + SM_LEAD_KEY, data=payload, timeout=20)
-        try:
-            j = r.json()
-        except Exception:
-            j = {}
+        try: j = r.json()
+        except Exception: j = {}
         result = j.get("Result", -1 if r.status_code != 200 else 0)
-        contact_id = str(j.get("ContactId", ""))
-        message = j.get("Message", "") or (f"HTTP {r.status_code}" if r.status_code != 200 else "")
+        return result, str(j.get("ContactId", "")), (j.get("Message", "") or (f"HTTP {r.status_code}" if r.status_code != 200 else ""))
     except Exception as e:
-        result, contact_id, message = -1, "", str(e)[:300]
+        return -1, "", str(e)[:300]
 
+
+@app.post("/lead")
+def lead(req: LeadReq):
+    """Landing-form -> ServiceMinder. Fires IMMEDIATELY (warm responders =
+    speed-to-lead). The SM key stays server-side."""
+    if not SM_LEAD_KEY:
+        raise HTTPException(500, "SM_LEAD_KEY not configured")
+    p = _map_lead(req.dict())
+    result, contact_id, message = _post_sm(p)
     conn = db()
     with conn, conn.cursor() as cur:
         cur.execute("insert into leads(name,email,phone,address1,city,state,postal,variant,page,notes,"
                     "sm_result,sm_contact_id,sm_message) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (req.name, req.email, req.phone, a1, city, state, postal, variant, req.page, notes,
-                     result, contact_id, message))
+                    (req.name, p["Email"], p["Phone1"], p["Address1"], p["City"], p["State"], p["PostalCode"],
+                     (req.version or "").lower(), req.page, p["Notes"], result, contact_id, message))
     conn.close()
-
-    ok = (result == 0)
-    if not ok:
-        # 200 back to the browser regardless (we logged it); surface status in body
+    if result != 0:
         return {"ok": False, "result": result, "message": message}
     return {"ok": True, "contact_id": contact_id}
 
@@ -224,6 +224,115 @@ def leads_recent(x_api_key: str = Header(default="")):
         rows = cur.fetchall()
     conn.close()
     return {"leads": rows}
+
+
+# ---------------------------------------------------------------------------
+# Outbound queue with delay (postcard recipients who haven't responded yet)
+# Holds each lead until ~8 days after queueing so the call happens AFTER the
+# postcard lands. DNC numbers are dropped at queue time. Inbound /lead is
+# unaffected (still instant).
+# ---------------------------------------------------------------------------
+OUTBOUND_DELAY_DAYS = int(os.environ.get("OUTBOUND_DELAY_DAYS", "8"))
+FLUSH_INTERVAL_SEC = int(os.environ.get("FLUSH_INTERVAL_SEC", "1800"))   # 30 min
+
+
+class OutboundLead(BaseModel):
+    name: str | None = None
+    address: str | None = None
+    address1: str | None = None
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    version: str | None = None
+    lf: int | None = None
+    quote: str | None = None
+    style: str | None = None
+    dnc: bool | None = False        # True = on Do-Not-Call list -> never queued
+    test: bool | None = False
+
+
+class OutboundReq(BaseModel):
+    leads: list[OutboundLead]
+    delay_days: int | None = None   # defaults to OUTBOUND_DELAY_DAYS (8)
+
+
+@app.post("/outbound")
+def outbound(req: OutboundReq, x_api_key: str = Header(default="")):
+    """Queue postcard recipients for a delayed call. DNC rows are skipped."""
+    _require_key(x_api_key)
+    delay = OUTBOUND_DELAY_DAYS if req.delay_days is None else req.delay_days
+    send_after = datetime.now(timezone.utc) + timedelta(days=delay)
+    queued = skipped = 0
+    conn = db()
+    with conn, conn.cursor() as cur:
+        for L in req.leads:
+            if L.dnc:
+                skipped += 1
+                continue
+            d = L.dict(); d.pop("dnc", None)
+            cur.execute("insert into outbound_queue(send_after,payload,status) values(%s,%s,'queued')",
+                        (send_after, json.dumps(d)))
+            queued += 1
+    conn.close()
+    return {"queued": queued, "skipped_dnc": skipped, "delay_days": delay,
+            "send_after": send_after.isoformat()}
+
+
+def flush_due(limit=1000):
+    """Send any queued outbound leads whose delay has elapsed."""
+    if not SM_LEAD_KEY:
+        return {"sent": 0, "errors": 0, "note": "SM_LEAD_KEY not set"}
+    conn = db(); sent = errors = 0
+    with conn, conn.cursor() as cur:
+        cur.execute("select id,payload from outbound_queue where status='queued' "
+                    "and send_after<=now() order by id limit %s", (limit,))
+        due = cur.fetchall()
+    for row_id, payload in due:
+        d = json.loads(payload)
+        result, cid, msg = _post_sm(_map_lead(d, source_note="FenceScout direct-mail outbound (postcard recipient)."))
+        ok = (result == 0)
+        sent += ok; errors += (not ok)
+        with conn, conn.cursor() as cur:
+            cur.execute("update outbound_queue set status=%s, sent_at=now(), sm_result=%s, sm_contact_id=%s, sm_message=%s "
+                        "where id=%s", ("sent" if ok else "error", result, cid, msg, row_id))
+    conn.close()
+    return {"sent": sent, "errors": errors, "due": len(due)}
+
+
+@app.post("/outbound/flush")
+def outbound_flush(x_api_key: str = Header(default="")):
+    """Manual trigger (the background thread also runs this every 30 min)."""
+    _require_key(x_api_key)
+    return flush_due()
+
+
+@app.get("/outbound/status")
+def outbound_status(x_api_key: str = Header(default="")):
+    _require_key(x_api_key)
+    conn = db()
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("select status, count(*) n from outbound_queue group by status")
+        counts = {r["status"]: r["n"] for r in cur.fetchall()}
+        cur.execute("select min(send_after) next_due from outbound_queue where status='queued'")
+        nxt = cur.fetchone()["next_due"]
+    conn.close()
+    return {"counts": counts, "next_due": nxt.isoformat() if nxt else None,
+            "delay_days": OUTBOUND_DELAY_DAYS}
+
+
+def _flusher_loop():
+    while True:
+        time.sleep(FLUSH_INTERVAL_SEC)
+        try:
+            flush_due()
+        except Exception:
+            pass
+
+
+# start the background flusher once, in-process (single web worker)
+threading.Thread(target=_flusher_loop, daemon=True).start()
 
 
 def _sat_static(lat, lng):
