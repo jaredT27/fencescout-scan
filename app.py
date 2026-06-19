@@ -33,6 +33,17 @@ MAPS_KEY = os.environ.get("GOOGLE_MAPS_KEY", "")
 MAX_HOMES = int(os.environ.get("MAX_HOMES", "1500"))
 WORKERS = int(os.environ.get("WORKERS", "8"))
 
+# --- ServiceMinder lead relay (Top Rail Fence) ---
+# SM_LEAD_KEY is the addupdate API key from Jakob. Set it in Railway Variables;
+# never hardcode it here. The key stays server-side so it never reaches the browser.
+SM_LEAD_KEY = os.environ.get("SM_LEAD_KEY", "")
+SM_LEAD_URL = "https://serviceminder.com/service/contact/addupdate/"
+SM_CHANNEL = os.environ.get("SM_CHANNEL", "Direct Mail")    # their existing channel
+SM_CAMPAIGN = os.environ.get("SM_CAMPAIGN", "Fence Scout")  # their identifier
+SM_DEFAULT_STATE = os.environ.get("SM_DEFAULT_STATE", "KY")
+# Pilot zips -> city, used to fill City when an address has no comma to split on.
+ZIP_CITY = {"40245": "Louisville", "40059": "Prospect", "40223": "Louisville"}
+
 
 def db():
     return psycopg2.connect(DATABASE_URL)
@@ -46,6 +57,9 @@ def init_db():
                     "lat double precision, lng double precision, no_fence_score real, "
                     "has_fence boolean, lf int, quote_lo int, quote_hi int)")
         cur.execute("create index if not exists idx_results_job on results(job_id)")
+        cur.execute("create table if not exists leads(id serial primary key, created timestamptz default now(), "
+                    "name text, email text, phone text, address1 text, city text, state text, postal text, "
+                    "variant text, page text, notes text, sm_result int, sm_contact_id text, sm_message text)")
 
 
 init_db()
@@ -70,6 +84,146 @@ class ScanReq(BaseModel):
 def _require_key(x_api_key):
     if SCAN_API_KEY and x_api_key != SCAN_API_KEY:
         raise HTTPException(401, "bad api key")
+
+
+# ---------------------------------------------------------------------------
+# ServiceMinder lead relay
+# ---------------------------------------------------------------------------
+import re
+
+
+class LeadReq(BaseModel):
+    name: str | None = None
+    address: str | None = None          # combined "123 Main St, Louisville, KY 40245"
+    address1: str | None = None         # OR pass components directly (preferred)
+    city: str | None = None
+    state: str | None = None
+    zip: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    version: str | None = None          # postcard variant a / b
+    page: str | None = None             # landing URL
+    lf: int | None = None               # estimated linear feet
+    quote: str | None = None            # e.g. "$6,600 - $9,000"
+    style: str | None = None            # fence style if captured
+    test: bool | None = False           # mark a coordinated test lead
+
+
+def _split_name(name):
+    name = (name or "").strip()
+    if not name:
+        return "", ""
+    parts = name.split()
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def _parse_address(combined):
+    """Best-effort split of '123 Main St, Louisville, KY 40245' into parts.
+    Returns (address1, city, state, postal). Missing pieces come back ''."""
+    a1 = city = state = postal = ""
+    s = (combined or "").strip()
+    if not s:
+        return a1, city, state, postal
+    # pull "ST 12345" (state + zip) off the end wherever it sits
+    m = re.search(r"\b([A-Za-z]{2})\s+(\d{5})(?:-\d{4})?\b", s)
+    if m:
+        state = m.group(1).upper()
+        postal = m.group(2)
+        s = (s[:m.start()] + s[m.end():]).strip().strip(",").strip()
+    elif re.search(r"\b(\d{5})(?:-\d{4})?\b", s):  # bare zip
+        z = re.search(r"\b(\d{5})(?:-\d{4})?\b", s)
+        postal = z.group(1)
+        s = (s[:z.start()] + s[z.end():]).strip().strip(",").strip()
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) >= 2:
+        a1 = parts[0]
+        city = parts[1]
+        if not state and len(parts) >= 3:
+            state = parts[2].upper()
+    elif len(parts) == 1:
+        a1 = parts[0]
+    return a1, city, state, postal
+
+
+@app.post("/lead")
+def lead(req: LeadReq):
+    """Landing-form -> ServiceMinder. Browser posts JSON here; we map fields and
+    forward form-encoded to ServiceMinder's addupdate webhook with the key held
+    server-side. Fires immediately (warm responders = speed-to-lead)."""
+    if not SM_LEAD_KEY:
+        raise HTTPException(500, "SM_LEAD_KEY not configured")
+
+    first, last = _split_name(req.name)
+    # prefer explicit components; fall back to parsing the combined string
+    a1, city, state, postal = (req.address1 or ""), (req.city or ""), (req.state or ""), (req.zip or "")
+    if not (a1 and city and postal):
+        pa1, pcity, pstate, ppostal = _parse_address(req.address)
+        a1 = a1 or pa1
+        city = city or pcity
+        state = state or pstate
+        postal = postal or ppostal
+    state = state or SM_DEFAULT_STATE
+    if not city and postal in ZIP_CITY:
+        city = ZIP_CITY[postal]
+
+    variant = (req.version or "").lower()
+    note_lines = ["Lead from FenceScout landing page."]
+    if req.style:  note_lines.append(f"Fence style: {req.style}")
+    if req.lf:     note_lines.append(f"Estimated fence length: {req.lf} ft")
+    if req.quote:  note_lines.append(f"Quoted range: {req.quote}")
+    if variant:    note_lines.append(f"Postcard variant: {variant.upper()}")
+    if req.page:   note_lines.append(f"Landing page: {req.page}")
+    if req.test:   note_lines.insert(0, "*** TEST LEAD - DO NOT CALL ***")
+    notes = "\n".join(note_lines)
+
+    tags = "FenceScout" + (f",variant-{variant}" if variant in ("a", "b") else "")
+    payload = {
+        "FirstName": first, "LastName": last,
+        "Email": req.email or "", "Phone1": req.phone or "", "Phone1Type": "Mobile",
+        "Address1": a1, "City": city, "State": state, "PostalCode": postal,
+        "Channel": SM_CHANNEL, "Campaign": SM_CAMPAIGN,
+        "Tags": tags, "ContactType": "Prospect", "Notes": notes,
+    }
+    try:
+        r = requests.post(SM_LEAD_URL + SM_LEAD_KEY, data=payload, timeout=20)
+        try:
+            j = r.json()
+        except Exception:
+            j = {}
+        result = j.get("Result", -1 if r.status_code != 200 else 0)
+        contact_id = str(j.get("ContactId", ""))
+        message = j.get("Message", "") or (f"HTTP {r.status_code}" if r.status_code != 200 else "")
+    except Exception as e:
+        result, contact_id, message = -1, "", str(e)[:300]
+
+    conn = db()
+    with conn, conn.cursor() as cur:
+        cur.execute("insert into leads(name,email,phone,address1,city,state,postal,variant,page,notes,"
+                    "sm_result,sm_contact_id,sm_message) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (req.name, req.email, req.phone, a1, city, state, postal, variant, req.page, notes,
+                     result, contact_id, message))
+    conn.close()
+
+    ok = (result == 0)
+    if not ok:
+        # 200 back to the browser regardless (we logged it); surface status in body
+        return {"ok": False, "result": result, "message": message}
+    return {"ok": True, "contact_id": contact_id}
+
+
+@app.get("/leads/recent")
+def leads_recent(x_api_key: str = Header(default="")):
+    """Quick check that leads are landing (and their SM result). Protected by SCAN_API_KEY if set."""
+    _require_key(x_api_key)
+    conn = db()
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("select created,name,phone,email,city,postal,variant,sm_result,sm_contact_id,sm_message "
+                    "from leads order by id desc limit 25")
+        rows = cur.fetchall()
+    conn.close()
+    return {"leads": rows}
 
 
 def _sat_static(lat, lng):
